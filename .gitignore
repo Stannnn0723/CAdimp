@@ -1,0 +1,31 @@
+*.idea
+*~
+*__pycache__*
+*.pyc
+*.pytest_cache
+*.ipynb_checkpoints/
+ltr/admin/local.py
+ltr/run_ltr_local.py
+ltr/train_settings/*/debug.py
+pytracking/parameter/*/debug.py
+pytracking/networks/
+pytracking/tracking_results/
+pytracking/segmentation_results/
+pytracking/result_plots/
+pytracking/evaluation/local.py
+pytracking/run_local.py
+
+# Custom igonres
+.venv/
+tracking_results/
+checkpoints/
+tensorboard/
+
+
+# Large models and data
+pretrained_networks/
+curvature_viz/
+curvature_viz_baseline/
+*.npz
+*.pth*
+

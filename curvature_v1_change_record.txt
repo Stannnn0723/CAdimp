@@ -1,0 +1,93 @@
+Curvature V1 change record for rollback
+=====================================
+
+Date: 2026-04-04
+Workspace: /data/lyx/project/pytracking-master
+
+Changed files
+-------------
+1. ltr/actors/tracking.py
+2. ltr/train_settings/dimp/super_dimp.py
+
+What was added
+--------------
+A. In `KLDiMPActor`:
+- new constructor argument: `curvature_params=None`
+- new actor hyperparameters:
+  - `self.curvature_score_thresh`
+  - `self.curvature_target_expand`
+- new helper methods:
+  - `_laplacian2d()`
+  - `_bbox_to_score_mask()`
+  - `_compute_curvature_loss()`
+- new training loss term:
+  - `loss_curvature = self.loss_weight['curvature'] * self._compute_curvature_loss(...)`
+- new stats entry:
+  - `stats['Loss/curvature']`
+
+B. In `ltr/train_settings/dimp/super_dimp.py`:
+- added settings:
+  - `settings.curvature_loss_weight = 5.0`
+  - `settings.curvature_score_thresh = 0.05`
+  - `settings.curvature_target_expand = 1.5`
+- extended `loss_weight` with:
+  - `'curvature': settings.curvature_loss_weight`
+- created `curvature_params` and passed them into `tracking_actors.KLDiMPActor(...)`
+
+Rollback guide
+--------------
+To remove Curvature V1 and return to the previous training behavior:
+
+1. In `ltr/actors/tracking.py`
+- Restore the original `KLDiMPActor.__init__` signature:
+
+    def __init__(self, net, objective, loss_weight=None):
+        super().__init__(net, objective)
+        if loss_weight is None:
+            loss_weight = {'bb_ce': 1.0}
+        self.loss_weight = loss_weight
+
+- Delete these helper methods from `KLDiMPActor`:
+  - `_laplacian2d`
+  - `_bbox_to_score_mask`
+  - `_compute_curvature_loss`
+
+- Delete this block before total loss:
+
+    # Curvature-aware background suppression loss on the final classifier score map
+    loss_curvature = 0
+    if self.loss_weight.get('curvature', 0) > 0:
+        loss_curvature = self.loss_weight['curvature'] * self._compute_curvature_loss(
+            target_scores[-1], data['test_anno'], data['test_images'], is_valid)
+
+- Restore total loss to:
+
+    loss = loss_bb_ce + loss_clf_ce + loss_clf_ce_init + loss_clf_ce_iter + \
+                        loss_target_classifier + loss_test_init_clf + loss_test_iter_clf
+
+- Delete the logging line:
+
+    if 'curvature' in self.loss_weight.keys():
+        stats['Loss/curvature'] = loss_curvature.item() if torch.is_tensor(loss_curvature) else loss_curvature
+
+2. In `ltr/train_settings/dimp/super_dimp.py`
+- Delete these settings:
+
+    settings.curvature_loss_weight = 5.0
+    settings.curvature_score_thresh = 0.05
+    settings.curvature_target_expand = 1.5
+
+- Restore `loss_weight` to:
+
+    loss_weight = {'bb_ce': 0.01, 'test_clf': 100, 'test_init_clf': 100, 'test_iter_clf': 400}
+
+- Remove `curvature_params = ...`
+
+- Restore actor construction to:
+
+    actor = tracking_actors.KLDiMPActor(net=net, objective=objective, loss_weight=loss_weight)
+
+Notes
+-----
+- The new resume config created for continued training is kept in a separate file, so rollback of Curvature V1 does not require deleting the new resume config.
+- If you want a strict code rollback later, this note can be converted into a patch file.
