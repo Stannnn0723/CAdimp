@@ -323,7 +323,7 @@ class PrDiMPSteepestDescentNewton(nn.Module):
 class CurvatureAwareDiMP(nn.Module):
     __doc__ = 'Curvature-Aware Anisotropic Regularization for DiMP.\n\n    Replaces isotropic L2 regularization ½λ||w||² with anisotropic\n    curvature-aware regularization ½λ(w - w*)ᵀdiag(H̄)(w - w*), where H̄\n    is an EMA of the empirical quasi-Hessian diagonal accumulated from\n    the memory bank. High-curvature directions (large H̄ entries) are\n    anchored strongly toward the anchor, while low-curvature directions\n    receive weaker regularization and can adapt more freely.\n\n    Key implementation insight: diag(JᵀWJ) never requires instantiating\n    the Jacobian matrix. Because DiMP\'s score map is computed as a\n    per-channel spatial convolution, JᵀWJ is block-diagonal across\n    channels. The diagonal element for channel c is simply the\n    sample/mask-weighted sum of squared features in that channel:\n\n        diag(H)ᵗ = Σ_{h,w} W_{h,w} · score_mask_{h,w} · (x_{c,h,w})²\n\n    This is an element-wise weighted sum per channel — O(D) memory\n    and O(HWD) time, completely independent of the filter kernel size.\n\n    Key theoretical claim (distilled from extensive discussion):\n      Rather than claiming "FIM protects small targets" (which is false,\n      since small targets have low gradient energy and hence low H̄),\n      the core contribution is: replacing the isotropic scalar damping\n      λ with the anisotropic tensor λ·diag(H̄) yields better background\n      suppression stability in non-i.i.d. online data streams.  High-H̄\n      directions are directions where the filter must work hard to\n      suppress large-area background — we anchor these so the filter\n      cannot trade away background suppression for short-term clutter\n      fitting.  Low-H̄ directions receive less regularization and are\n      free to adapt to current-frame evidence (including genuine small-\n      target appearance changes); dead channels and noise simply remain\n      inactive.\n    '
 
-    def __init__(self, num_iter=1, feat_stride=16, init_step_length=1.0, init_filter_reg=0.01, init_gauss_sigma=1.0, num_dist_bins=5, bin_displacement=1.0, mask_init_factor=4.0, score_act="relu", act_param=None, min_filter_reg=0.001, mask_act="sigmoid", detach_length=float("Inf"), alpha_eps=0, use_curvature_reg=False, use_curvature_shield=True, ema_momentum=0.01, anchor_update_interval=5, init_anchor_from="init", curvature_reg_weight=1.0):
+    def __init__(self, num_iter=1, feat_stride=16, init_step_length=1.0, init_filter_reg=0.01, init_gauss_sigma=1.0, num_dist_bins=5, bin_displacement=1.0, mask_init_factor=4.0, score_act="relu", act_param=None, min_filter_reg=0.001, mask_act="sigmoid", detach_length=float("Inf"), alpha_eps=0, use_curvature_reg=False, use_curvature_shield=True, ema_momentum=0.01, anchor_update_interval=5, anchor_update_mode="smooth", anchor_step_beta=0.05, init_anchor_from="init", curvature_reg_weight=1.0):
         super().__init__()
         self.num_iter = num_iter
         self.feat_stride = feat_stride
@@ -337,6 +337,10 @@ class CurvatureAwareDiMP(nn.Module):
         self.use_curvature_shield = use_curvature_shield
         self.ema_momentum = ema_momentum
         self.anchor_update_interval = anchor_update_interval
+        self.anchor_update_mode = str(anchor_update_mode).lower()
+        if self.anchor_update_mode not in ("smooth", "step", "hybrid"):
+            self.anchor_update_mode = "smooth"
+        self.anchor_step_beta = anchor_step_beta
         self.init_anchor_from = init_anchor_from
         self.curvature_reg_weight = curvature_reg_weight
         self.H_diag_ema = None
@@ -453,6 +457,35 @@ class CurvatureAwareDiMP(nn.Module):
         ni, ns, d = weighted_energy.shape[0], weighted_energy.shape[1], weighted_energy.shape[2]
         feat_h_in = weighted_energy.shape[-2]
         feat_w_in = weighted_energy.shape[-1]
+
+        # [CHANNEL RELIABILITY] Apply spatial compactness filter
+        if getattr(self, 'use_channel_reliability', False):
+            # Grid coordinates
+            y_coords = torch.arange(feat_h_in, device=weighted_energy.device, dtype=torch.float32).view(1, 1, 1, feat_h_in, 1)
+            x_coords = torch.arange(feat_w_in, device=weighted_energy.device, dtype=torch.float32).view(1, 1, 1, 1, feat_w_in)
+            
+            sum_w = weighted_energy.sum(dim=(-2, -1), keepdim=True) + 1e-8
+            mu_y = (weighted_energy * y_coords).sum(dim=(-2, -1), keepdim=True) / sum_w
+            mu_x = (weighted_energy * x_coords).sum(dim=(-2, -1), keepdim=True) / sum_w
+            
+            var_y = (weighted_energy * (y_coords - mu_y)**2).sum(dim=(-2, -1), keepdim=True) / sum_w
+            var_x = (weighted_energy * (x_coords - mu_x)**2).sum(dim=(-2, -1), keepdim=True) / sum_w
+            
+            # Normalize spread by size of feature map to make it resolution-invariant
+            spread_c = (var_y / (feat_h_in**2) + var_x / (feat_w_in**2)) * 100.0
+            
+            thresh = getattr(self, '_channel_spread_thresh', 1.0)
+            strength = getattr(self, '_channel_reliability_strength', 2.0)
+            
+            # Map spread to reliability (exponential decay if spread > thresh)
+            channel_rel = torch.exp(-strength * F.relu(spread_c - thresh))
+            
+            # Normalize channel reliability so the best channel is 1
+            max_rel = channel_rel.max(dim=2, keepdim=True)[0].clamp_min(1e-8)
+            channel_rel = channel_rel / max_rel
+            
+            weighted_energy = weighted_energy * channel_rel
+
         _pool_scale = feat_h_in / K_h * (feat_w_in / K_w)
         H_diag_per_sample = F.adaptive_avg_pool2d(weighted_energy.reshape(ni * ns, d, feat_h_in, feat_w_in), (
          K_h, K_w)).reshape(ni, ns, d, K_h, K_w) * _pool_scale
@@ -460,31 +493,54 @@ class CurvatureAwareDiMP(nn.Module):
         return H_diag
 
     def _update_slow_anchor(self, weights, feat, target_mask, sample_weight, spatial_weight):
-        """Synchronized EMA update of slow anchor weights and quasi-Hessian EMA.
+        """Update slow anchor weights and quasi-Hessian EMA with configurable mode.
 
-        RISK-3 FIX: w* and H̄ are updated together — same EMA momentum β,
-        same gate condition, same frame.  This prevents "temporal tearing":
-        a high-H̄ (punishing hard) paired with an old w* (referencing a
-        different regime) would apply unreasonable force in the wrong regime.
-
-        [STATE-AWARE] Also updates H_diag_norm_ema (running EMA of per-channel max).
+        Modes:
+            smooth: EMA update every optimizer call.
+            step:   Hold anchor for N calls, then hard-copy update.
+            hybrid: Hold anchor for N calls, then EMA with anchor_step_beta.
         """
         if not self.use_curvature_reg:
             return
-        else:
-            self._anchor_updated_in_frame = False
-            filter_sz = (
-             weights.shape[-2], weights.shape[-1])
-            H_diag = self._compute_H_diag(feat, target_mask, sample_weight, spatial_weight, filter_sz)
-            if self.H_diag_ema is None:
+
+        self._anchor_updated_in_frame = False
+        filter_sz = (
+         weights.shape[-2], weights.shape[-1])
+        H_diag = self._compute_H_diag(feat, target_mask, sample_weight, spatial_weight, filter_sz)
+
+        if self.H_diag_ema is None:
+            self.H_diag_ema = H_diag.detach().clone()
+            self.weights_anchor = weights.detach().clone()
+            self._anchor_updated_in_frame = True
+            self._update_H_diag_norm_ema(H_diag)
+            return
+
+        mode = self.anchor_update_mode
+        interval = max(1, int(self.anchor_update_interval))
+
+        if mode == "step":
+            self._anchor_frame_counter += 1
+            if self._anchor_frame_counter >= interval:
                 self.H_diag_ema = H_diag.detach().clone()
                 self.weights_anchor = weights.detach().clone()
+                self._anchor_frame_counter = 0
                 self._anchor_updated_in_frame = True
-            else:
-                self.H_diag_ema = (1 - self.ema_momentum) * self.H_diag_ema + self.ema_momentum * H_diag.detach()
-                anchor_momentum = max(1e-06, min(1.0, self.ema_momentum * 0.2))
-                self.weights_anchor = (1 - anchor_momentum) * self.weights_anchor + anchor_momentum * weights.detach()
+        elif mode == "hybrid":
+            self._anchor_frame_counter += 1
+            if self._anchor_frame_counter >= interval:
+                beta = max(1e-6, min(1.0, float(self.anchor_step_beta)))
+                self.H_diag_ema = (1 - beta) * self.H_diag_ema + beta * H_diag.detach()
+                self.weights_anchor = (1 - beta) * self.weights_anchor + beta * weights.detach()
+                self._anchor_frame_counter = 0
                 self._anchor_updated_in_frame = True
+        else:
+            self._anchor_frame_counter = 0
+            self.H_diag_ema = (1 - self.ema_momentum) * self.H_diag_ema + self.ema_momentum * H_diag.detach()
+            anchor_momentum = max(1e-06, min(1.0, self.ema_momentum * 0.2))
+            self.weights_anchor = (1 - anchor_momentum) * self.weights_anchor + anchor_momentum * weights.detach()
+            self._anchor_updated_in_frame = True
+
+        self._update_H_diag_norm_ema(H_diag)
 
     def _extract_radar_state(self, scores):
         """Extract per-frame radar state used by shield and anchor gating."""

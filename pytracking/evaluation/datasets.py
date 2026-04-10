@@ -52,6 +52,8 @@ dataset_dict = dict(
     lagot_sot_mode=DatasetInfo(module=pt % "lagot", class_name="LaGOTDataset", kwargs=dict(sot_mode=True)),
     lagot=DatasetInfo(module=pt % "lagot", class_name="LaGOTDataset", kwargs=dict(sot_mode=False)),
     latot=DatasetInfo(module=pt % "latot", class_name="LaToTDataset", kwargs=dict()),
+    small112=DatasetInfo(module=pt % "small112", class_name="Small112Dataset", kwargs=dict()),
+    small90=DatasetInfo(module=pt % "small90", class_name="Small90Dataset", kwargs=dict()),
 )
 
 

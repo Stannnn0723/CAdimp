@@ -23,6 +23,10 @@ class EnvSettings:
         self.davis_dir = ''
         self.youtubevos_dir = ''
 
+        self.latot_path = ''
+        self.small112_path = ''
+        self.small90_path = ''
+
         self.got_packed_results_path = ''
         self.got_reports_path = ''
         self.tn_packed_results_path = ''

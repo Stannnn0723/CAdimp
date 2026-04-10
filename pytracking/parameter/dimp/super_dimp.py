@@ -29,14 +29,21 @@ def parameters():
     # [CURVATURE-AWARE] Curvature-Aware Anisotropic Regularization hyperparameters.
     # Set use_curvature_reg=True to enable.  No retraining required — works with
     # the pre-trained super_dimp.pth.tar checkpoint injected at runtime.
-    params.use_curvature_reg = True # ← 改为 False 关闭曲率感知（原版 Super DiMP）
+    params.use_curvature_reg = True# ← 改为 False 关闭曲率感知（原版 Super DiMP）
     # EMA momentum for the quasi-Hessian diagonal accumulation (H_diag_ema).
     # Smaller values → smoother, slower adaptation; larger values → faster response
     # to new background configurations but more noise.  Typical range: [0.005, 0.05].
     params.curvature_ema_momentum = 0.01
     # Only update the slow anchor weights (weights_anchor) every N normal updates.
     # Set > 1 to prevent distractor-corrupted frames from polluting the anchor.
-    params.curvature_anchor_interval = 5
+    params.curvature_anchor_interval = 10
+    # Anchor update strategy:
+    # 'smooth': EMA update every optimizer call (current default behavior).
+    # 'step':   hold for interval calls, then hard copy update.
+    # 'hybrid': hold for interval calls, then EMA with curvature_anchor_step_beta.
+    params.curvature_anchor_update_mode = 'step'
+    # EMA factor used only when curvature_anchor_update_mode='hybrid'.
+    params.curvature_anchor_step_beta = 0.05
     # Where to initialise the slow anchor: 'init' (anchor from first high-quality
     # frame) or 'current' (anchor from the most recent clean frame).
     params.curvature_init_anchor_from = 'init'
@@ -53,7 +60,7 @@ def parameters():
     params.use_curvature_shield = True
     # [SOFT GATING] Toggle for the smooth sigmoid transition of the shield.
     # When True: penalty weight increases linearly using a Sigmoid function instead of a hard step.
-    params.use_curv_soft_gating = True
+    params.use_curv_soft_gating = False
     # Threshold for switching to hard (heavy-shield) mode.
     # When max_score < curv_low_score_th → λ = curv_hard_weight (10.0).
     # When max_score >= curv_low_score_th → λ = curv_soft_weight (1.0).
@@ -70,6 +77,20 @@ def parameters():
     # Half-width of the centre "target zone" to mask out (in feature-map pixels).
     # Target occupies roughly ±2–3 px in feature-map space (stride=16 → ±3 in map).
     params.curv_bg_radius = 2
+
+    # [CHANNEL RELIABILITY] Spatial variance based channel quality filter.
+    # When True: H_diag is weighted by per-channel reliability derived from spatial compactness.
+    # When False: use raw H_diag (baseline).
+    params.use_channel_reliability = True
+    # Strength of the spread penalty (spread → reliability mapping).
+    # High value → aggressive suppression of high-spread channels (background semantics).
+    # Recommended range: [1.0, 5.0].  Start at 2.0.
+    params.channel_reliability_strength = 2.0
+    # Spread threshold in normalized feature-map coordinates: channels with
+    # spread > thresh are treated as unreliable.
+    # Recommended range: [0.5, 2.0].  Start at 1.0.
+    params.channel_spread_thresh = 1.0
+
     # [DIAGNOSTIC LOGGER] Failure-case state dump switch.
     # Set True to enable per-frame internal-state logging and failed-sequence overlays.
     # Set False to disable saving failure cases and avoid performance/storage overhead during large scale testing.
@@ -80,6 +101,12 @@ def parameters():
     params.diag_dump_visual_overlay = False
     # Cap number of exported frames per failed sequence (lowest-IoU frames first).
     params.diag_dump_max_frames = 60
+
+    # [CURVATURE ANALYSIS] Quantitative statistics for GT overlap on LaTOT.
+    # Generates per-sequence csv/json and dataset_summary under results/.../curvature_analysis/.
+    params.enable_curvature_analysis = False
+    # Top-k ratio used for high-curvature hit-rate (e.g. top 5% pixels in score-map grid).
+    params.curvature_analysis_topk_ratio = 0.05
 
     # Detection parameters
     params.window_output = False

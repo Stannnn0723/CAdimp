@@ -22,4 +22,21 @@ def latot_test():
     trackers = trackerlist('latot', 'default', range(1))
     dataset = get_dataset('latot')
     return trackers, dataset
-    
+
+
+def small112_test():
+    trackers = trackerlist('dimp', 'super_dimp', range(1))
+    dataset = get_dataset('small112')
+    return trackers, dataset
+
+
+def small90_test():
+    trackers = trackerlist('dimp', 'super_dimp', range(1))
+    dataset = get_dataset('small90')
+    return trackers, dataset
+
+
+def small112_small90_test():
+    trackers = trackerlist('dimp', 'super_dimp', range(1))
+    dataset = get_dataset('small112', 'small90')
+    return trackers, dataset

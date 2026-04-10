@@ -34,6 +34,181 @@ def _get_diag_config(tracker: Tracker):
     }
 
 
+def _get_curvature_analysis_config(tracker: Tracker):
+    """Read curvature-analysis config from tracker parameters with safe defaults."""
+    try:
+        params = tracker.get_parameters()
+    except Exception:
+        return {
+            'enabled': False,
+            'topk_ratio': 0.05,
+            'output_subdir': 'curvature_analysis',
+        }
+
+    return {
+        'enabled': bool(params.get('enable_curvature_analysis', False)),
+        'topk_ratio': float(params.get('curvature_analysis_topk_ratio', 0.05)),
+        'output_subdir': str(params.get('curvature_analysis_output_subdir', 'curvature_analysis')),
+    }
+
+
+def _extract_valid_curvature_rows(output: dict):
+    """Collect valid per-frame curvature analysis dicts from tracker output."""
+    rows = []
+    for row in output.get('curvature_analysis', []):
+        if isinstance(row, dict) and row.get('valid', False):
+            rows.append(row)
+    rows.sort(key=lambda r: int(r.get('frame_num', -1)))
+    return rows
+
+
+def _summarize_curvature_rows(rows):
+    """Aggregate frame-level curvature metrics into one sequence summary."""
+    if len(rows) == 0:
+        return None
+
+    def _mean(key):
+        vals = [float(r.get(key, 0.0)) for r in rows if r.get(key, None) is not None]
+        if len(vals) == 0:
+            return None
+        return float(np.mean(vals))
+
+    mean_area = _mean('area_ratio')
+    mean_energy = _mean('energy_ratio')
+
+    summary = {
+        'num_valid_frames': int(len(rows)),
+        'mean_area_ratio': mean_area,
+        'mean_energy_ratio': mean_energy,
+        'mean_mean_fg': _mean('mean_fg'),
+        'mean_mean_bg': _mean('mean_bg'),
+        'mean_topk_hit_rate': _mean('topk_hit_rate'),
+        'topk_ratio': float(rows[0].get('topk_ratio', 0.05)),
+    }
+
+    if mean_area is not None and mean_area > 0 and mean_energy is not None:
+        summary['energy_over_area_gain'] = float(mean_energy / mean_area)
+    else:
+        summary['energy_over_area_gain'] = None
+
+    return summary
+
+
+def _save_curvature_sequence_analysis(seq: Sequence, tracker: Tracker, output: dict, cfg: dict):
+    """Save per-frame and per-sequence curvature analysis files."""
+    rows = _extract_valid_curvature_rows(output)
+    if len(rows) == 0:
+        return None
+
+    summary = _summarize_curvature_rows(rows)
+    if summary is None:
+        return None
+
+    root_dir = os.path.join(tracker.results_dir, cfg['output_subdir'])
+    seq_dir = os.path.join(root_dir, 'sequence_metrics')
+    os.makedirs(seq_dir, exist_ok=True)
+
+    csv_path = os.path.join(seq_dir, '{}.csv'.format(seq.name))
+    with open(csv_path, 'w', newline='') as fp:
+        writer = csv.DictWriter(fp, fieldnames=[
+            'frame_num', 'area_ratio', 'energy_ratio', 'mean_fg', 'mean_bg',
+            'topk_ratio', 'topk_hit_rate', 'gt_box_map'
+        ])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                'frame_num': int(row.get('frame_num', -1)),
+                'area_ratio': row.get('area_ratio', None),
+                'energy_ratio': row.get('energy_ratio', None),
+                'mean_fg': row.get('mean_fg', None),
+                'mean_bg': row.get('mean_bg', None),
+                'topk_ratio': row.get('topk_ratio', None),
+                'topk_hit_rate': row.get('topk_hit_rate', None),
+                'gt_box_map': row.get('gt_box_map', None),
+            })
+
+    summary.update({
+        'sequence': seq.name,
+        'dataset': seq.dataset,
+        'num_frames_total': int(len(seq.frames)),
+        'csv': csv_path,
+    })
+    json_path = os.path.join(seq_dir, '{}.json'.format(seq.name))
+    with open(json_path, 'w') as fp:
+        json.dump(summary, fp, indent=2)
+
+    return summary
+
+
+def _aggregate_curvature_dataset(dataset, trackers):
+    """Aggregate saved sequence summaries into one dataset-level summary per tracker."""
+    for tracker in trackers:
+        cfg = _get_curvature_analysis_config(tracker)
+        if not cfg.get('enabled', False):
+            continue
+
+        root_dir = os.path.join(tracker.results_dir, cfg['output_subdir'])
+        seq_dir = os.path.join(root_dir, 'sequence_metrics')
+        if not os.path.isdir(seq_dir):
+            continue
+
+        summaries = []
+        for seq in dataset:
+            seq_json = os.path.join(seq_dir, '{}.json'.format(seq.name))
+            if not os.path.isfile(seq_json):
+                continue
+            with open(seq_json, 'r') as fp:
+                summaries.append(json.load(fp))
+
+        if len(summaries) == 0:
+            continue
+
+        total_valid = int(sum(int(s.get('num_valid_frames', 0)) for s in summaries))
+        if total_valid <= 0:
+            continue
+
+        def _weighted_mean(key):
+            num = 0.0
+            den = 0.0
+            for s in summaries:
+                w = float(s.get('num_valid_frames', 0))
+                v = s.get(key, None)
+                if w <= 0 or v is None:
+                    continue
+                num += w * float(v)
+                den += w
+            if den <= 0:
+                return None
+            return float(num / den)
+
+        dataset_summary = {
+            'dataset': summaries[0].get('dataset', ''),
+            'tracker': '{}-{}-{}'.format(tracker.name, tracker.parameter_name, tracker.run_id),
+            'num_sequences_with_analysis': int(len(summaries)),
+            'num_valid_frames_total': total_valid,
+            'mean_area_ratio': _weighted_mean('mean_area_ratio'),
+            'mean_energy_ratio': _weighted_mean('mean_energy_ratio'),
+            'mean_mean_fg': _weighted_mean('mean_mean_fg'),
+            'mean_mean_bg': _weighted_mean('mean_mean_bg'),
+            'mean_topk_hit_rate': _weighted_mean('mean_topk_hit_rate'),
+            'mean_energy_over_area_gain': _weighted_mean('energy_over_area_gain'),
+            'topk_ratio': summaries[0].get('topk_ratio', cfg.get('topk_ratio', 0.05)),
+        }
+
+        os.makedirs(root_dir, exist_ok=True)
+        summary_json = os.path.join(root_dir, 'dataset_summary.json')
+        with open(summary_json, 'w') as fp:
+            json.dump(dataset_summary, fp, indent=2)
+
+        summary_csv = os.path.join(root_dir, 'dataset_summary.csv')
+        with open(summary_csv, 'w', newline='') as fp:
+            writer = csv.DictWriter(fp, fieldnames=list(dataset_summary.keys()))
+            writer.writeheader()
+            writer.writerow(dataset_summary)
+
+        print('Curvature analysis summary saved: {}'.format(summary_json))
+
+
 def _bbox_iou_xywh(box_a, box_b):
     """Compute IoU for two xywh boxes."""
     if box_a is None or box_b is None:
@@ -361,18 +536,36 @@ def _save_tracker_output(seq: Sequence, tracker: Tracker, output: dict):
 def run_sequence(seq: Sequence, tracker: Tracker, debug=False, visdom_info=None):
     """Runs a tracker on a sequence."""
 
+    curv_cfg = _get_curvature_analysis_config(tracker)
+
+    def _curvature_summary_exists():
+        if not curv_cfg.get('enabled', False):
+            return True
+        summary_file = os.path.join(
+            tracker.results_dir,
+            curv_cfg.get('output_subdir', 'curvature_analysis'),
+            'sequence_metrics',
+            '{}.json'.format(seq.name),
+        )
+        return os.path.isfile(summary_file)
+
     def _results_exist():
         if seq.dataset == 'oxuva':
             vid_id, obj_id = seq.name.split('_')[:2]
             pred_file = os.path.join(tracker.results_dir, '{}_{}.csv'.format(vid_id, obj_id))
-            return os.path.isfile(pred_file)
+            result_exists = os.path.isfile(pred_file)
         elif seq.object_ids is None:
             bbox_file = '{}/{}.txt'.format(tracker.results_dir, seq.name)
-            return os.path.isfile(bbox_file)
+            result_exists = os.path.isfile(bbox_file)
         else:
             bbox_files = ['{}/{}_{}.txt'.format(tracker.results_dir, seq.name, obj_id) for obj_id in seq.object_ids]
             missing = [not os.path.isfile(f) for f in bbox_files]
-            return sum(missing) == 0
+            result_exists = (sum(missing) == 0)
+
+        if not result_exists:
+            return False
+
+        return _curvature_summary_exists()
 
     visdom_info = {} if visdom_info is None else visdom_info
 
@@ -410,6 +603,19 @@ def run_sequence(seq: Sequence, tracker: Tracker, debug=False, visdom_info=None)
         if metrics is not None and metrics['mean_iou'] < diag_cfg['failure_iou_threshold']:
             _dump_failure_case(seq, tracker, output, metrics, diag_cfg)
             print('Diagnostic dump saved for failed sequence: {} | mean IoU {:.3f}'.format(seq.name, metrics['mean_iou']))
+
+    if curv_cfg.get('enabled', False):
+        curv_summary = _save_curvature_sequence_analysis(seq, tracker, output, curv_cfg)
+        if curv_summary is not None:
+            print(
+                'Curvature metrics | {} | energy={:.4f} area={:.4f} topk_hit={:.4f} valid_frames={}'.format(
+                    seq.name,
+                    float(curv_summary.get('mean_energy_ratio', 0.0)),
+                    float(curv_summary.get('mean_area_ratio', 0.0)),
+                    float(curv_summary.get('mean_topk_hit_rate', 0.0)),
+                    int(curv_summary.get('num_valid_frames', 0)),
+                )
+            )
 
     if not debug:
         if seq.dataset == 'oxuva':
@@ -487,3 +693,5 @@ def run_dataset(dataset, trackers, debug=False, threads=0, visdom_info=None, gpu
     if valid_fps:
         avg_fps = sum(valid_fps) / len(valid_fps)
         print('Average FPS: {:.2f}'.format(avg_fps))
+
+    _aggregate_curvature_dataset(dataset, trackers)

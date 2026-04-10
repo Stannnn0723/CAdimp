@@ -179,7 +179,8 @@ class Tracker:
                   'segmentation': [],
                   'object_presence_score': [],
                   'diagnostic_state': [],
-                  'diag_score_map': []}
+                  'diag_score_map': [],
+                  'curvature_analysis': []}
 
         def _store_outputs(tracker_out: dict, defaults=None):
             defaults = {} if defaults is None else defaults
@@ -207,7 +208,8 @@ class Tracker:
                         'segmentation': init_info.get('init_mask'),
                         'object_presence_score': 1.,
                         'diagnostic_state': {},
-                        'diag_score_map': None}
+                        'diag_score_map': None,
+                        'curvature_analysis': None}
 
         _store_outputs(out, init_default)
 
@@ -240,6 +242,8 @@ class Tracker:
             start_time = time.time()
 
             info = seq.frame_info(frame_num)
+            if seq.ground_truth_rect is not None and not isinstance(seq.ground_truth_rect, (dict, OrderedDict)) and frame_num < len(seq.ground_truth_rect):
+                info['gt_bbox'] = seq.ground_truth_rect[frame_num].tolist()
             info['previous_output'] = prev_output
 
             out = tracker.track(image, info)

@@ -63,6 +63,8 @@ class DiMP(BaseTracker):
             use_curvature_shield=self.params.get('use_curvature_shield', True),
             ema_momentum=self.params.get('curvature_ema_momentum', 0.01),
             anchor_update_interval=self.params.get('curvature_anchor_interval', 5),
+            anchor_update_mode=self.params.get('curvature_anchor_update_mode', 'smooth'),
+            anchor_step_beta=self.params.get('curvature_anchor_step_beta', 0.05),
             init_anchor_from=self.params.get('curvature_init_anchor_from', 'init'),
             curvature_reg_weight=self.params.get('curvature_reg_weight', 10.0),
         )
@@ -75,6 +77,9 @@ class DiMP(BaseTracker):
         new_opt._curv_bg_thresh     = self.params.get('curv_bg_thresh',     0.40)
         new_opt._curv_bg_radius     = self.params.get('curv_bg_radius',     2)
         new_opt._use_curv_soft_gating = self.params.get('use_curv_soft_gating', True)
+        new_opt.use_channel_reliability = self.params.get('use_channel_reliability', True)
+        new_opt._channel_reliability_strength = self.params.get('channel_reliability_strength', 2.0)
+        new_opt._channel_spread_thresh = self.params.get('channel_spread_thresh', 1.0)
 
         # Copy every learned submodule from the original into the new optimizer
         # so that pre-trained label-map / mask / spatial-weight predictors keep working.
@@ -263,6 +268,15 @@ class DiMP(BaseTracker):
             output_state = new_state.tolist()
 
         out = {'target_bbox': output_state}
+
+        if self.params.get('enable_curvature_analysis', False):
+            out['curvature_analysis'] = self._collect_curvature_metrics(
+                info=info,
+                score_map=score_map,
+                sample_coords=sample_coords,
+                scale_ind=scale_ind,
+            )
+
         if self.diag_debug_mode:
             opt = self.net.classifier.filter_optimizer
             diag_state = dict(getattr(opt, '_last_diag_state', {}) or {})
@@ -273,6 +287,153 @@ class DiMP(BaseTracker):
             out['diagnostic_state'] = diag_state
             out['diag_score_map'] = score_map.detach().cpu().float().numpy().astype(np.float32)
         return out
+
+    def _collect_curvature_metrics(self, info, score_map, sample_coords, scale_ind):
+        """Compute GT-inside curvature statistics on the current score-map grid."""
+        result = {
+            'valid': False,
+            'frame_num': int(self.frame_num),
+        }
+
+        if info is None:
+            return result
+
+        gt_bbox = info.get('gt_bbox', None)
+        if gt_bbox is None or len(gt_bbox) != 4:
+            return result
+
+        opt = getattr(self.net.classifier, 'filter_optimizer', None)
+        if opt is None:
+            return result
+
+        h_diag_ema = getattr(opt, 'H_diag_ema', None)
+        if h_diag_ema is None:
+            return result
+
+        curv_map = self._build_curvature_map(score_map, h_diag_ema)
+        if curv_map is None:
+            return result
+
+        if torch.is_tensor(sample_coords):
+            sample_box = sample_coords[scale_ind, ...].detach().cpu().tolist()
+        else:
+            sample_box = sample_coords[scale_ind]
+
+        bbox_on_map = self._project_bbox_to_map(
+            gt_bbox=gt_bbox,
+            sample_box=sample_box,
+            map_h=curv_map.shape[0],
+            map_w=curv_map.shape[1],
+        )
+        if bbox_on_map is None:
+            return result
+
+        topk_ratio = float(self.params.get('curvature_analysis_topk_ratio', 0.05))
+        metrics = self._compute_curvature_metrics(curv_map, bbox_on_map, topk_ratio)
+        metrics['frame_num'] = int(self.frame_num)
+        return metrics
+
+    @staticmethod
+    def _build_curvature_map(score_map, h_diag_ema):
+        """Project H_diag_ema to a 2D map aligned with the current score map."""
+        if score_map is None or h_diag_ema is None:
+            return None
+
+        curv = h_diag_ema
+        while curv.dim() > 2:
+            curv = curv.mean(dim=0)
+
+        if curv.dim() != 2:
+            return None
+
+        out_h, out_w = int(score_map.shape[-2]), int(score_map.shape[-1])
+        curv = curv.unsqueeze(0).unsqueeze(0).float()
+        curv = F.interpolate(curv, size=(out_h, out_w), mode='bilinear', align_corners=False)
+        curv = curv.squeeze(0).squeeze(0)
+        curv = torch.nan_to_num(curv, nan=0.0, posinf=0.0, neginf=0.0)
+        curv = torch.clamp(curv, min=0.0)
+        return curv
+
+    @staticmethod
+    def _project_bbox_to_map(gt_bbox, sample_box, map_h, map_w):
+        """Project image-space GT bbox (xywh) into score-map coordinates."""
+        if gt_bbox is None or sample_box is None:
+            return None
+
+        try:
+            gx, gy, gw, gh = [float(v) for v in gt_bbox]
+            sy1, sx1, sy2, sx2 = [float(v) for v in sample_box]
+        except Exception:
+            return None
+
+        if gw <= 0 or gh <= 0:
+            return None
+
+        patch_w = max(1e-6, sx2 - sx1)
+        patch_h = max(1e-6, sy2 - sy1)
+
+        gx1 = gx
+        gy1 = gy
+        gx2 = gx + gw
+        gy2 = gy + gh
+
+        mx1 = (gx1 - sx1) / patch_w * map_w
+        mx2 = (gx2 - sx1) / patch_w * map_w
+        my1 = (gy1 - sy1) / patch_h * map_h
+        my2 = (gy2 - sy1) / patch_h * map_h
+
+        x1 = int(math.floor(max(0.0, min(float(map_w), mx1))))
+        x2 = int(math.ceil(max(0.0, min(float(map_w), mx2))))
+        y1 = int(math.floor(max(0.0, min(float(map_h), my1))))
+        y2 = int(math.ceil(max(0.0, min(float(map_h), my2))))
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _compute_curvature_metrics(curv_map, bbox_on_map, topk_ratio):
+        """Compute area/energy ratio, FG-BG means and Top-K hit rate."""
+        x1, y1, x2, y2 = bbox_on_map
+        map_h, map_w = curv_map.shape
+        total_area = map_h * map_w
+        eps = 1e-6
+
+        fg_mask = torch.zeros((map_h, map_w), dtype=torch.bool, device=curv_map.device)
+        fg_mask[y1:y2, x1:x2] = True
+        bg_mask = ~fg_mask
+
+        fg_area = int(fg_mask.sum().item())
+        bg_area = int(bg_mask.sum().item())
+        if fg_area <= 0:
+            return {'valid': False}
+
+        fg_energy = curv_map[fg_mask].sum().item()
+        bg_energy = curv_map[bg_mask].sum().item() if bg_area > 0 else 0.0
+        total_energy = fg_energy + bg_energy
+
+        area_ratio = float(fg_area) / float(max(1, total_area))
+        energy_ratio = float(fg_energy) / float(total_energy + eps)
+        mean_fg = float(fg_energy) / float(max(1, fg_area))
+        mean_bg = float(bg_energy) / float(max(1, bg_area))
+
+        topk_ratio = max(0.0, min(1.0, float(topk_ratio)))
+        topk_num = max(1, int(total_area * topk_ratio))
+        flat_curv = curv_map.flatten()
+        _, topk_idx = torch.topk(flat_curv, k=topk_num)
+        hit_rate = float(fg_mask.flatten()[topk_idx].float().mean().item())
+
+        return {
+            'valid': True,
+            'area_ratio': area_ratio,
+            'energy_ratio': energy_ratio,
+            'mean_fg': mean_fg,
+            'mean_bg': mean_bg,
+            'topk_ratio': float(topk_ratio),
+            'topk_hit_rate': hit_rate,
+            'gt_box_map': [int(x1), int(y1), int(x2), int(y2)],
+        }
 
 
     def get_sample_location(self, sample_coord):
