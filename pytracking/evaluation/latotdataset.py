@@ -6,11 +6,14 @@ from pathlib import Path
 
 class LaToTDataset(BaseDataset):
 
-    def __init__(self, vos_mode=False, attribute=None, test_sequences_path="/data/lyx/dataset/LaTOT/test_sequences.txt"):
+    def __init__(self, vos_mode=False, attribute=None, test_sequences_path=None):
         super().__init__()
         self.base_path = self.env_settings.latot_path
-        # 新增：接收测试序列文件路径参数
-        self.test_sequences_path = test_sequences_path
+        # 若未指定，则默认从 latot_path 目录下寻找 test_sequences.txt
+        if test_sequences_path is None:
+            self.test_sequences_path = os.path.join(self.base_path, "test_sequences.txt")
+        else:
+            self.test_sequences_path = test_sequences_path
         self.sequence_info_list = self._get_sequence_info_list()
         self.sr_scale = 2
 

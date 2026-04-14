@@ -54,6 +54,7 @@ dataset_dict = dict(
     latot=DatasetInfo(module=pt % "latot", class_name="LaToTDataset", kwargs=dict()),
     small112=DatasetInfo(module=pt % "small112", class_name="Small112Dataset", kwargs=dict()),
     small90=DatasetInfo(module=pt % "small90", class_name="Small90Dataset", kwargs=dict()),
+    dtb70=DatasetInfo(module=pt % "dtb", class_name="DTBDataset", kwargs=dict()),
 )
 
 

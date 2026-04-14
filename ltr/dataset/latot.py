@@ -3,17 +3,18 @@ import os
 import numpy as np
 import random
 from collections import OrderedDict
-from lib.train.data import jpeg4py_loader  # 若没有可替换成 PIL.Image.open
+from ltr.data.image_loader import jpeg4py_loader  # 若没有可替换成 PIL.Image.open
 from .base_video_dataset import BaseVideoDataset
-from lib.train.admin import env_settings
+from ltr.admin.environment import env_settings
 
 class LaToT(BaseVideoDataset):
     def __init__(self, root=None, image_loader=jpeg4py_loader, data_fraction=None, seed=42, split='train'):
         self.root = env_settings().latot_dir if root is None else root
         super().__init__('LaToT', self.root, image_loader)
 
-        # 所有序列文件夹名
-        all_sequences = sorted(os.listdir(self.root))
+        # 过滤掉普通文件以及不包含 img 子文件夹的非序列目录（例如内部多出来的备份 LaTOT 文件夹）
+        all_sequences = [d for d in os.listdir(self.root) if os.path.isdir(os.path.join(self.root, d, 'img'))]
+        all_sequences = sorted(all_sequences)
 
         # 读取测试序列文件
         test_file_path = os.path.join(self.root, 'test_sequences.txt')
@@ -37,6 +38,9 @@ class LaToT(BaseVideoDataset):
             random.seed(seed)
             sample_size = int(len(self.sequence_list) * data_fraction)
             self.sequence_list = random.sample(self.sequence_list, sample_size)
+
+        print(f"[{self.name} Dataset - {split}] Total sequences in dir: {len(all_sequences)}, "
+              f"Test sequences in txt: {len(test_sequences)}. Loaded {len(self.sequence_list)} sequences.")
 
         # 预存每个序列的图像文件名
         self.seq_img_map = {}
@@ -84,15 +88,16 @@ class LaToT(BaseVideoDataset):
         """获取单个序列的边界框、有效性等信息"""
         seq_path = os.path.join(self.root, self.sequence_list[seq_name])
         bbox = self._read_bb_anno(seq_path)
-        # 标记有效边界框（宽和高需大于 0，可根据实际需求调整阈值）
+        # 标记有效边界框：只需要宽和高不为 0 和负数即可，保留极小目标
         valid = (bbox[:, 2] > 0) & (bbox[:, 3] > 0)
+
         visible = valid.clone().byte()  # 简单认为可见性与有效性一致，可按需修改
         return {'bbox': bbox, 'valid': valid, 'visible': visible}
 
     def _get_frame(self, seq_path, frame_id):
-        """加载单个序列指定帧的图像"""
-        frame_path = os.path.join(seq_path, 'img', sorted([p for p in os.listdir(os.path.join(seq_path, 'img')) if
-                                                           os.path.splitext(p)[1] in ['.jpg', '.png', '.bmp']])[frame_id])
+        # 获取单个帧的图像路径，通过预存的影像字典可以保证索引不出格
+        seq_name = os.path.basename(seq_path)
+        frame_path = os.path.join(seq_path, 'img', self.seq_img_map[seq_name][frame_id])
         frame = self.image_loader(frame_path)
         return frame
 

@@ -26,6 +26,7 @@ class EnvSettings:
         self.latot_path = ''
         self.small112_path = ''
         self.small90_path = ''
+        self.dtb70_path = ''
 
         self.got_packed_results_path = ''
         self.got_reports_path = ''

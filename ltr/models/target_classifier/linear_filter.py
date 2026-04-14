@@ -48,16 +48,26 @@ class LinearFilter(nn.Module):
         assert train_bb.dim() == 3
 
         num_sequences = train_bb.shape[1]
+        return_aux = kwargs.pop('return_aux', False)
 
         # Extract features
         train_feat = self.extract_classification_feat(train_feat, num_sequences)
         test_feat = self.extract_classification_feat(test_feat, num_sequences)
 
         # Train filter
-        filter, filter_iter, losses = self.get_filter(train_feat, train_bb, *args, **kwargs)
+        filter, filter_iter, losses, optimizer_aux = self.get_filter(train_feat, train_bb, return_aux=return_aux, *args, **kwargs)
 
         # Classify samples using all return filters
         test_scores = [self.classify(f, test_feat) for f in filter_iter]
+
+        if return_aux:
+            aux_data = {
+                'train_feat_clf': train_feat,
+                'test_feat_clf': test_feat,
+            }
+            if optimizer_aux is not None:
+                aux_data.update(optimizer_aux)
+            return test_scores, aux_data
 
         return test_scores
 
@@ -92,13 +102,22 @@ class LinearFilter(nn.Module):
             losses:  Train losses."""
 
         weights = self.filter_initializer(feat, bb)
+        return_aux = kwargs.pop('return_aux', False)
 
         if self.filter_optimizer is not None:
-            weights, weights_iter, losses = self.filter_optimizer(weights, feat=feat, bb=bb, *args, **kwargs)
+            if return_aux:
+                optimizer_out = self.filter_optimizer(weights, feat=feat, bb=bb, return_aux=True, *args, **kwargs)
+                weights, weights_iter, losses, optimizer_aux = optimizer_out
+            else:
+                weights, weights_iter, losses = self.filter_optimizer(weights, feat=feat, bb=bb, *args, **kwargs)
+                optimizer_aux = None
         else:
             weights_iter = [weights]
             losses = None
+            optimizer_aux = None
 
+        if return_aux:
+            return weights, weights_iter, losses, optimizer_aux
         return weights, weights_iter, losses
 
     def train_classifier(self, backbone_feat, bb):
@@ -111,7 +130,7 @@ class LinearFilter(nn.Module):
         train_feat = self.extract_classification_feat(backbone_feat, num_sequences)
 
         # Get filters from each iteration
-        final_filter, _, train_losses = self.get_filter(train_feat, bb)
+        final_filter, _, train_losses, _ = self.get_filter(train_feat, bb)
         return final_filter, train_losses
 
     def track_frame(self, filter_weights, backbone_feat):

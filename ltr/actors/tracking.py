@@ -1,4 +1,5 @@
 from . import BaseActor
+import math
 import torch
 import torch.nn.functional as F
 
@@ -73,11 +74,274 @@ class DiMPActor(BaseActor):
 
 class KLDiMPActor(BaseActor):
     """Actor for training the DiMP network."""
-    def __init__(self, net, objective, loss_weight=None):
+    def __init__(self, net, objective, loss_weight=None, curvature_params=None):
         super().__init__(net, objective)
         if loss_weight is None:
             loss_weight = {'bb_ce': 1.0}
         self.loss_weight = loss_weight
+        self.curvature_params = curvature_params if curvature_params is not None else {}
+
+    def _get_compact_warmup_weight(self, settings, epoch):
+        if not getattr(settings, 'use_curvature_compact_loss', False):
+            return 0.0
+
+        final_weight = float(getattr(settings, 'curvature_compact_loss_weight', 0.0))
+        start_epoch = int(getattr(settings, 'curvature_compact_warmup_start_epoch', 0))
+        end_epoch = int(getattr(settings, 'curvature_compact_warmup_end_epoch', start_epoch))
+        warmup_type = getattr(settings, 'curvature_compact_warmup_type', 'cosine')
+
+        if epoch <= start_epoch:
+            return 0.0
+        if end_epoch <= start_epoch or epoch >= end_epoch:
+            return final_weight
+
+        progress = float(epoch - start_epoch) / float(end_epoch - start_epoch)
+        progress = max(0.0, min(1.0, progress))
+
+        if warmup_type == 'cosine':
+            scale = 0.5 * (1.0 - math.cos(math.pi * progress))
+        else:
+            scale = progress
+        return final_weight * scale
+
+    def _compute_compact_loss(self, data, aux_data):
+        settings = data['settings']
+        eps = float(getattr(settings, 'curvature_compact_eps', 1e-6))
+
+        feat_source = getattr(settings, 'curvature_compact_feat_source', 'test')
+        if feat_source == 'train':
+            feat = aux_data.get('train_feat_clf', None)
+            anno = data['train_anno']
+        else:
+            feat = aux_data.get('test_feat_clf', None)
+            anno = data['test_anno']
+
+        label_map = aux_data.get('optimizer_label_map', None)
+        if feat is None or label_map is None:
+            zero = data['test_images'].new_tensor(0.0)
+            return zero, {
+                'selected_mean': 0.0,
+                'selected_min': 0.0,
+                'selected_max': 0.0,
+                'empty_ratio': 1.0,
+                'mean_spread_selected': 0.0,
+                'mean_spread_all': 0.0,
+                'mean_rtg_selected': 0.0,
+                'mean_q_selected': 0.0,
+                'mean_centroid_min_dist': 0.0,
+                'selection_success_ratio': 0.0,
+            }
+
+        num_images, num_sequences, num_channels, feat_h, feat_w = feat.shape
+        feat_flat = feat.reshape(-1, num_channels, feat_h, feat_w)
+
+        label_h, label_w = label_map.shape[-2], label_map.shape[-1]
+        if label_h != feat_h or label_w != feat_w:
+            label_map = label_map[..., :feat_h, :feat_w].contiguous()
+
+        label_flat = label_map.reshape(-1, feat_h, feat_w)
+        anno_flat = anno.reshape(-1, anno.shape[-1])
+        valid_flat = (anno_flat[:, 0] < 99999.0)
+
+        core_thresh = float(getattr(settings, 'curvature_mask_core_thresh', 0.6))
+        ring_thresh = float(getattr(settings, 'curvature_mask_ring_thresh', 0.1))
+        out_thresh = float(getattr(settings, 'curvature_mask_out_thresh', 0.05))
+        ring_weight = float(getattr(settings, 'curvature_mask_ring_weight', 0.35))
+
+        rtg_thresh = float(getattr(settings, 'curvature_rtg_thresh', 0.6))
+        select_k_min = int(getattr(settings, 'curvature_select_k_min', 8))
+        select_k_max = int(getattr(settings, 'curvature_select_k_max', 24))
+        select_pre_k = int(getattr(settings, 'curvature_select_pre_k', 64))
+        centroid_min_dist = float(getattr(settings, 'curvature_centroid_min_dist', 0.18))
+
+        tau = float(getattr(settings, 'curvature_compact_tau', 0.18))
+        beta = float(getattr(settings, 'curvature_compact_beta', 0.05))
+        use_q_weight = bool(getattr(settings, 'curvature_compact_use_q_weight', True))
+        min_size_cells = float(getattr(settings, 'curvature_compact_min_size_cells', 0.0))
+        use_dynamic_tau = bool(getattr(settings, 'curvature_compact_use_dynamic_tau', False))
+        dynamic_tau_alpha = float(getattr(settings, 'curvature_compact_dynamic_tau_alpha', 1.0))
+        dynamic_tau_area_ref = float(getattr(settings, 'curvature_compact_dynamic_tau_area_ref', 0.02))
+
+        m_core = (label_flat > core_thresh).float()
+        m_ring = ((label_flat > ring_thresh) & (label_flat <= core_thresh)).float() * ring_weight
+        m_in = (m_core + m_ring).clamp(max=1.0)
+        m_out = (label_flat < out_thresh).float()
+
+        y_coords = torch.linspace(0.0, 1.0, feat_h, device=feat.device, dtype=feat.dtype).view(1, 1, feat_h, 1)
+        x_coords = torch.linspace(0.0, 1.0, feat_w, device=feat.device, dtype=feat.dtype).view(1, 1, 1, feat_w)
+
+        activation = F.relu(feat_flat) ** 2
+
+        weighted_in = activation * m_in.unsqueeze(1)
+        energy_in = weighted_in.sum(dim=(-1, -2))
+        energy_all = activation.sum(dim=(-1, -2))
+        energy_out = (activation * m_out.unsqueeze(1)).sum(dim=(-1, -2))
+
+        rtg = energy_in / (energy_all + eps)
+        leakage = energy_out / (energy_in + eps)
+
+        core_energy = (activation * m_core.unsqueeze(1)).sum(dim=(-1, -2))
+        core_norm = core_energy + eps
+        mu_x = ((activation * m_core.unsqueeze(1)) * x_coords).sum(dim=(-1, -2)) / core_norm
+        mu_y = ((activation * m_core.unsqueeze(1)) * y_coords).sum(dim=(-1, -2)) / core_norm
+        centroids = torch.stack((mu_x, mu_y), dim=-1)
+
+        in_norm = weighted_in.sum(dim=(-1, -2)) + eps
+        mean_x = (weighted_in * x_coords).sum(dim=(-1, -2)) / in_norm
+        mean_y = (weighted_in * y_coords).sum(dim=(-1, -2)) / in_norm
+        var_x = (weighted_in * (x_coords - mean_x.unsqueeze(-1).unsqueeze(-1)) ** 2).sum(dim=(-1, -2)) / in_norm
+        var_y = (weighted_in * (y_coords - mean_y.unsqueeze(-1).unsqueeze(-1)) ** 2).sum(dim=(-1, -2)) / in_norm
+
+        widths = (anno_flat[:, 2] / float(getattr(settings, 'output_sz', feat_w))).clamp(min=eps)
+        heights = (anno_flat[:, 3] / float(getattr(settings, 'output_sz', feat_h))).clamp(min=eps)
+
+        if min_size_cells > 0.0:
+            min_width = min_size_cells / float(feat_w)
+            min_height = min_size_cells / float(feat_h)
+            widths_safe = torch.clamp(widths, min=min_width)
+            heights_safe = torch.clamp(heights, min=min_height)
+        else:
+            widths_safe = widths
+            heights_safe = heights
+
+        spread = var_x / (widths_safe.unsqueeze(1) ** 2 + eps) + var_y / (heights_safe.unsqueeze(1) ** 2 + eps)
+
+        if use_dynamic_tau:
+            area_safe = (widths_safe * heights_safe).detach()
+            area_ref = max(dynamic_tau_area_ref, eps)
+            tiny_factor = torch.exp(-area_safe / area_ref)
+            dynamic_tau = tau * (1.0 + dynamic_tau_alpha * tiny_factor)
+        else:
+            dynamic_tau = widths_safe.new_full((widths_safe.shape[0],), tau)
+
+        q_score = energy_in * leakage
+
+        compact_loss_acc = feat.new_tensor(0.0)
+        valid_sample_count = 0
+        selected_counts = []
+        preselected_counts = []
+        spread_selected_vals = []
+        spread_all_vals = []
+        rtg_selected_vals = []
+        q_selected_vals = []
+        centroid_dist_vals = []
+        empty_count = 0
+        success_count = 0
+
+        for idx in range(feat_flat.shape[0]):
+            if not bool(valid_flat[idx]):
+                continue
+
+            spread_all_vals.append(spread[idx].mean())
+
+            with torch.no_grad():
+                candidate_mask = rtg[idx] > rtg_thresh
+                candidate_indices = torch.nonzero(candidate_mask, as_tuple=False).flatten()
+                preselected_counts.append(float(candidate_indices.numel()))
+
+                if candidate_indices.numel() == 0:
+                    selected_indices = candidate_indices
+                    selected_q = q_score[idx].new_zeros((0,))
+                    selected_min_dist = q_score[idx].new_tensor(0.0)
+                else:
+                    candidate_q = q_score[idx, candidate_indices]
+                    pre_k = min(select_pre_k, candidate_indices.numel())
+                    top_q, top_pos = torch.topk(candidate_q, k=pre_k, largest=True, sorted=True)
+                    pre_idx = candidate_indices[top_pos]
+                    pre_centroids = centroids[idx, pre_idx]
+                    if pre_idx.numel() > 1:
+                        dist_mat = torch.cdist(pre_centroids.unsqueeze(0), pre_centroids.unsqueeze(0)).squeeze(0)
+                    else:
+                        dist_mat = pre_centroids.new_zeros((1, 1))
+
+                    chosen_positions = []
+                    for pos in range(pre_idx.numel()):
+                        if len(chosen_positions) >= select_k_max:
+                            break
+                        if len(chosen_positions) == 0:
+                            chosen_positions.append(pos)
+                            continue
+                        dists = dist_mat[pos, torch.tensor(chosen_positions, device=dist_mat.device)]
+                        if torch.all(dists > centroid_min_dist):
+                            chosen_positions.append(pos)
+
+                    if len(chosen_positions) < min(select_k_min, pre_idx.numel()):
+                        for pos in range(pre_idx.numel()):
+                            if pos not in chosen_positions:
+                                chosen_positions.append(pos)
+                            if len(chosen_positions) >= min(select_k_min, pre_idx.numel()):
+                                break
+
+                    chosen_positions = chosen_positions[:min(select_k_max, pre_idx.numel())]
+                    if len(chosen_positions) > 0:
+                        chosen_positions_t = torch.tensor(chosen_positions, device=pre_idx.device, dtype=torch.long)
+                        selected_indices = pre_idx[chosen_positions_t]
+                        selected_q = top_q[chosen_positions_t]
+                        if selected_indices.numel() > 1:
+                            selected_centroids = centroids[idx, selected_indices]
+                            selected_dist = torch.cdist(selected_centroids.unsqueeze(0), selected_centroids.unsqueeze(0)).squeeze(0)
+                            selected_dist = selected_dist + torch.eye(selected_dist.shape[0], device=selected_dist.device, dtype=selected_dist.dtype) * 1e6
+                            selected_min_dist = selected_dist.min(dim=1)[0].mean()
+                        else:
+                            selected_min_dist = top_q.new_tensor(0.0)
+                    else:
+                        selected_indices = pre_idx[:0]
+                        selected_q = top_q[:0]
+                        selected_min_dist = top_q.new_tensor(0.0)
+
+            selected_counts.append(float(selected_indices.numel()))
+            centroid_dist_vals.append(selected_min_dist)
+
+            if selected_indices.numel() == 0:
+                empty_count += 1
+                continue
+
+            success_count += 1
+            valid_sample_count += 1
+
+            selected_spread = spread[idx, selected_indices]
+            selected_rtg = rtg[idx, selected_indices]
+            spread_selected_vals.append(selected_spread.mean())
+            rtg_selected_vals.append(selected_rtg.mean())
+            q_selected_vals.append(selected_q.mean())
+
+            distance_over_tau = F.relu(selected_spread - dynamic_tau[idx])
+            compact_vec = F.smooth_l1_loss(distance_over_tau, torch.zeros_like(distance_over_tau), beta=beta, reduction='none')
+            if use_q_weight and selected_q.numel() > 0:
+                q_weights = selected_q / (selected_q.sum() + eps)
+                compact_loss_acc = compact_loss_acc + (compact_vec * q_weights).sum()
+            else:
+                compact_loss_acc = compact_loss_acc + compact_vec.mean()
+
+        if valid_sample_count > 0:
+            compact_loss = compact_loss_acc / valid_sample_count
+        else:
+            compact_loss = feat.new_tensor(0.0)
+
+        def _safe_mean(vals):
+            if len(vals) == 0:
+                return 0.0
+            stacked = [v if torch.is_tensor(v) else feat.new_tensor(v) for v in vals]
+            return torch.stack(stacked).mean().item()
+
+        metrics = {
+            'selected_mean': sum(selected_counts) / max(len(selected_counts), 1),
+            'selected_min': min(selected_counts) if len(selected_counts) > 0 else 0.0,
+            'selected_max': max(selected_counts) if len(selected_counts) > 0 else 0.0,
+            'preselected_mean': sum(preselected_counts) / max(len(preselected_counts), 1),
+            'empty_ratio': float(empty_count) / max(len(selected_counts), 1),
+            'mean_spread_selected': _safe_mean(spread_selected_vals),
+            'mean_spread_all': _safe_mean(spread_all_vals),
+            'mean_rtg_selected': _safe_mean(rtg_selected_vals),
+            'mean_q_selected': _safe_mean(q_selected_vals),
+            'mean_centroid_min_dist': _safe_mean(centroid_dist_vals),
+            'selection_success_ratio': float(success_count) / max(len(selected_counts), 1),
+            'mean_dynamic_tau': dynamic_tau.mean().item(),
+            'mean_width_safe': widths_safe.mean().item(),
+            'mean_height_safe': heights_safe.mean().item(),
+        }
+
+        return compact_loss, metrics
 
     def __call__(self, data):
         """
@@ -90,10 +354,11 @@ class KLDiMPActor(BaseActor):
             stats  -  dict containing detailed losses
         """
         # Run network
-        target_scores, bb_scores = self.net(train_imgs=data['train_images'],
-                                            test_imgs=data['test_images'],
-                                            train_bb=data['train_anno'],
-                                            test_proposals=data['test_proposals'])
+        target_scores, bb_scores, aux_data = self.net(train_imgs=data['train_images'],
+                                                      test_imgs=data['test_images'],
+                                                      train_bb=data['train_anno'],
+                                                      test_proposals=data['test_proposals'],
+                                                      return_aux=True)
 
         # Reshape bb reg variables
         is_valid = data['test_anno'][:, :, 0] < 99999.0
@@ -153,9 +418,18 @@ class KLDiMPActor(BaseActor):
                 else:
                     loss_clf_ce_iter = (test_iter_weights / (len(clf_ce_losses) - 2)) * sum(clf_ce_losses[1:-1])
 
+        compact_loss = data['test_images'].new_tensor(0.0)
+        compact_loss_weighted = data['test_images'].new_tensor(0.0)
+        compact_metrics = None
+        compact_lambda = 0.0
+        if getattr(data['settings'], 'use_curvature_compact_loss', False) and self.net.training:
+            compact_loss, compact_metrics = self._compute_compact_loss(data, aux_data)
+            compact_lambda = self._get_compact_warmup_weight(data['settings'], int(data.get('epoch', 0)))
+            compact_loss_weighted = compact_loss * compact_lambda
+
         # Total loss
         loss = loss_bb_ce + loss_clf_ce + loss_clf_ce_init + loss_clf_ce_iter + \
-                            loss_target_classifier + loss_test_init_clf + loss_test_iter_clf
+                            loss_target_classifier + loss_test_init_clf + loss_test_iter_clf + compact_loss_weighted
 
         if torch.isinf(loss) or torch.isnan(loss):
             raise Exception('ERROR: Loss was nan or inf!!!')
@@ -163,7 +437,12 @@ class KLDiMPActor(BaseActor):
         # Log stats
         stats = {'Loss/total': loss.item(),
                  'Loss/bb_ce': bb_ce.item(),
-                 'Loss/loss_bb_ce': loss_bb_ce.item()}
+                 'Loss/loss_bb_ce': loss_bb_ce.item(),
+                 'Loss/compact': compact_loss.item(),
+                 'Loss/compact_weighted': compact_loss_weighted.item(),
+                 'CurvCompact/lambda': compact_lambda,
+                 'CurvCompact/tau': float(getattr(data['settings'], 'curvature_compact_tau', 0.0)),
+                 'CurvCompact/beta': float(getattr(data['settings'], 'curvature_compact_beta', 0.0))}
         if 'test_clf' in self.loss_weight.keys():
             stats['Loss/target_clf'] = loss_target_classifier.item()
         if 'test_init_clf' in self.loss_weight.keys():
@@ -174,6 +453,21 @@ class KLDiMPActor(BaseActor):
             stats['Loss/clf_ce'] = loss_clf_ce.item()
         if 'clf_ce_init' in self.loss_weight.keys():
             stats['Loss/clf_ce_init'] = loss_clf_ce_init.item()
+        if compact_metrics is not None:
+            stats['CurvCompact/selected_channels_mean'] = compact_metrics['selected_mean']
+            stats['CurvCompact/selected_channels_min'] = compact_metrics['selected_min']
+            stats['CurvCompact/selected_channels_max'] = compact_metrics['selected_max']
+            stats['CurvCompact/preselected_channels_mean'] = compact_metrics['preselected_mean']
+            stats['CurvCompact/empty_selection_ratio'] = compact_metrics['empty_ratio']
+            stats['CurvCompact/mean_spread_selected'] = compact_metrics['mean_spread_selected']
+            stats['CurvCompact/mean_spread_all'] = compact_metrics['mean_spread_all']
+            stats['CurvCompact/mean_rtg_selected'] = compact_metrics['mean_rtg_selected']
+            stats['CurvCompact/mean_q_selected'] = compact_metrics['mean_q_selected']
+            stats['CurvCompact/mean_centroid_min_dist'] = compact_metrics['mean_centroid_min_dist']
+            stats['CurvCompact/selection_success_ratio'] = compact_metrics['selection_success_ratio']
+            stats['CurvCompact/mean_dynamic_tau'] = compact_metrics['mean_dynamic_tau']
+            stats['CurvCompact/mean_width_safe'] = compact_metrics['mean_width_safe']
+            stats['CurvCompact/mean_height_safe'] = compact_metrics['mean_height_safe']
 
         if 'test_clf' in self.loss_weight.keys():
             stats['ClfTrain/test_loss'] = clf_loss_test.item()

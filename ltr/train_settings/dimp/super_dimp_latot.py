@@ -1,5 +1,8 @@
+import os
+import torch
 import torch.optim as optim
 from ltr.dataset import Lasot, Got10k, TrackingNet, MSCOCOSeq
+from ltr.dataset.latot import LaToT
 from ltr.data import processing, sampler, LTRLoader
 from ltr.models.tracking import dimpnet
 import ltr.models.loss as ltr_losses
@@ -8,16 +11,18 @@ import ltr.actors.tracking as tracking_actors
 from ltr.trainers import LTRTrainer
 import ltr.data.transforms as tfm
 from ltr import MultiGPU
+import ltr.admin.loading as network_loading
 
 
 def run(settings):
-    settings.description = 'SuperDiMP: Combines the DiMP classifier with the PrDiMP bounding box regressor and better' \
-                           'training settings (larger batch size, inside_major cropping, and flipping augmentation.' \
-                           'Gives results significantly better than both DiMP-50 and PrDiMP-50.'
-    settings.batch_size = 20
-    settings.num_workers = 8
+    settings.description = 'SuperDiMP with LaTOT: Continues training from super_dimp checkpoint, ' \
+                           'using LaTOT as the primary dataset (ratio=10) with LaSOT, GOT-10k, ' \
+                           'TrackingNet, and COCO as supplementary datasets (ratio=3 each) to ' \
+                           'maintain generalization on common objects.'
+    settings.batch_size = 64
+    settings.num_workers = 10
     settings.multi_gpu = True
-    settings.print_interval = 1
+    settings.print_interval = 50
     settings.normalize_mean = [0.485, 0.456, 0.406]
     settings.normalize_std = [0.229, 0.224, 0.225]
     settings.search_area_factor = 6.0
@@ -30,17 +35,49 @@ def run(settings):
     settings.curvature_loss_weight = 5.0
     settings.curvature_score_thresh = 0.05
     settings.curvature_target_expand = 1.5
-    # settings.print_stats = ['Loss/total', 'Loss/iou', 'ClfTrain/init_loss', 'ClfTrain/test_loss']
+    settings.curvature_rtg_thresh = 0.35
+    settings.hinge_threshold = 0.05
 
-    # Train datasets
+    # Enable compact loss
+    settings.use_curvature_compact_loss = True
+    settings.curvature_compact_feat_source = 'test'
+    settings.curvature_compact_loss_weight = 0.1
+    settings.curvature_compact_warmup_start_epoch = 10
+    settings.curvature_compact_warmup_end_epoch = 20
+    settings.curvature_compact_warmup_type = 'cosine'
+    settings.curvature_compact_eps = 1e-6
+
+    # Compact loss mask thresholds
+    settings.curvature_mask_core_thresh = 0.5
+    settings.curvature_mask_ring_thresh = 0.05
+    settings.curvature_mask_out_thresh = 0.05
+    settings.curvature_mask_ring_weight = 0.5
+
+    # Selection parameters
+    settings.curvature_select_k_min = 8
+    settings.curvature_select_k_max = 24
+    settings.curvature_select_pre_k = 64
+    settings.curvature_centroid_min_dist = 0.10
+
+    # Compact loss penalty parameters
+    settings.curvature_compact_tau = 0.08
+    settings.curvature_compact_beta = 0.05
+    settings.curvature_compact_use_q_weight = True
+    settings.curvature_compact_min_size_cells = 1.5
+    settings.curvature_compact_use_dynamic_tau = True
+    settings.curvature_compact_dynamic_tau_alpha = 1.0
+    settings.curvature_compact_dynamic_tau_area_ref = 0.02
+
+    # Train datasets - LaTOT as primary, others as supplementary
+    # Sampling ratio: LaTOT(10) : LaSOT(3) : GOT-10k(3) : TrackingNet(3) : COCO(3)
+    latot_train = LaToT(settings.env.latot_dir, split='train')
     lasot_train = Lasot(settings.env.lasot_dir, split='train')
     got10k_train = Got10k(settings.env.got10k_dir, split='vottrain')
     trackingnet_train = TrackingNet(settings.env.trackingnet_dir, set_ids=list(range(4)))
-    coco_train = MSCOCOSeq(settings.env.coco_dir)
+    coco_train = MSCOCOSeq(settings.env.coco_dir,version='2017')
 
     # Validation datasets
     got10k_val = Got10k(settings.env.got10k_dir, split='votval')
-
 
     # Data transform
     transform_joint = tfm.Transform(tfm.ToGrayscale(probability=0.05),
@@ -85,10 +122,13 @@ def run(settings):
                                                       transform=transform_val,
                                                       joint_transform=transform_joint)
 
-    # Train sampler and loader
-    dataset_train = sampler.DiMPSampler([lasot_train, got10k_train, trackingnet_train, coco_train], [1,1,1,1],
-                                        samples_per_epoch=40000, max_gap=200, num_test_frames=3, num_train_frames=3,
-                                        processing=data_processing_train)
+    # Train sampler and loader with mixed datasets
+    # LaTOT ratio=10 (primary), others ratio=3 (supplementary)
+    dataset_train = sampler.DiMPSampler(
+        [latot_train, lasot_train, got10k_train, trackingnet_train, coco_train],
+        [10, 3, 3, 3, 3],
+        samples_per_epoch=40000, max_gap=200, num_test_frames=3, num_train_frames=3,
+        processing=data_processing_train)
 
     loader_train = LTRLoader('train', dataset_train, training=True, batch_size=settings.batch_size, num_workers=settings.num_workers,
                              shuffle=True, drop_last=True, stack_dim=1)
@@ -108,6 +148,14 @@ def run(settings):
                             init_gauss_sigma=output_sigma * settings.feature_sz, num_dist_bins=100,
                             bin_displacement=0.1, mask_init_factor=3.0, target_mask_act='sigmoid', score_act='relu',
                             frozen_backbone_layers=['conv1', 'bn1', 'layer1', 'layer2'])
+
+    # Load pretrained super_dimp weights for resume training
+    # Training will auto-resume from latest checkpoint in checkpoints/ltr/dimp/super_dimp_latot/
+    super_dimp_pretrained_path = os.path.join(settings.env.pretrained_networks, 'super_dimp.pth.tar')
+    if os.path.exists(super_dimp_pretrained_path):
+        print(f'Loading pretrained super_dimp weights from: {super_dimp_pretrained_path}')
+        checkpoint_dict = torch.load(super_dimp_pretrained_path, map_location='cpu')
+        net.load_state_dict(checkpoint_dict['net'], strict=False)
 
     # Wrap the network for multi GPU training
     if settings.multi_gpu:
@@ -136,4 +184,7 @@ def run(settings):
 
     trainer = LTRTrainer(actor, [loader_train, loader_val], optimizer, settings, lr_scheduler)
 
+    # Continue training from pretrained weights or latest checkpoint
+    # - First run: loads super_dimp.pth.tar as initial weights
+    # - Resume run: loads latest checkpoint from checkpoints/ltr/dimp/super_dimp_latot/
     trainer.train(50, load_latest=True, fail_safe=False)

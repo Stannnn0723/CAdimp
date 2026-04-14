@@ -48,6 +48,8 @@ class DiMPnet(nn.Module):
 
         assert train_imgs.dim() == 5 and test_imgs.dim() == 5, 'Expect 5 dimensional inputs'
 
+        return_aux = kwargs.pop('return_aux', False)
+
         # Extract backbone features
         train_feat = self.extract_backbone_features(train_imgs.reshape(-1, *train_imgs.shape[-3:]))
         test_feat = self.extract_backbone_features(test_imgs.reshape(-1, *test_imgs.shape[-3:]))
@@ -57,7 +59,12 @@ class DiMPnet(nn.Module):
         test_feat_clf = self.get_backbone_clf_feat(test_feat)
 
         # Run classifier module
-        target_scores = self.classifier(train_feat_clf, test_feat_clf, train_bb, *args, **kwargs)
+        classifier_out = self.classifier(train_feat_clf, test_feat_clf, train_bb, *args, return_aux=return_aux, **kwargs)
+        if return_aux:
+            target_scores, classifier_aux = classifier_out
+        else:
+            target_scores = classifier_out
+            classifier_aux = None
 
         # Get bb_regressor features
         train_feat_iou = self.get_backbone_bbreg_feat(train_feat)
@@ -65,6 +72,9 @@ class DiMPnet(nn.Module):
 
         # Run the IoUNet module
         iou_pred = self.bb_regressor(train_feat_iou, test_feat_iou, train_bb, test_proposals)
+
+        if return_aux:
+            return target_scores, iou_pred, classifier_aux
 
         return target_scores, iou_pred
 

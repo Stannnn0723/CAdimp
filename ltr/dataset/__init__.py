@@ -1,3 +1,4 @@
+from .latot import LaToT
 from .lasot import Lasot
 from .lasotvos import LasotVOS
 from .got10k import Got10k

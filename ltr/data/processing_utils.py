@@ -178,7 +178,9 @@ def sample_target_adaptive(im, target_bb, search_area_factor, output_sz, mode: s
         crop_sz_y = math.floor(crop_sz_y / rescale_factor)
 
     if crop_sz_x < 1 or crop_sz_y < 1:
-        raise Exception('Too small bounding box.')
+        # 对于极小目标，强制将裁剪尺寸放大到至少 1 像素，防止报错崩溃
+        crop_sz_x = max(1, crop_sz_x)
+        crop_sz_y = max(1, crop_sz_y)
 
     x1 = round(bbx + 0.5 * bbw - crop_sz_x * 0.5)
     x2 = x1 + crop_sz_x

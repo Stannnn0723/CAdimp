@@ -24,6 +24,13 @@ def latot_test():
     return trackers, dataset
 
 
+def super_dimp_latot_latot():
+    """SuperDiMP with super_dimp_latot params (LaTOT fine-tuned net in param file or overridden by test script)."""
+    trackers = trackerlist('dimp', 'super_dimp_latot', range(1))
+    dataset = get_dataset('latot')
+    return trackers, dataset
+
+
 def small112_test():
     trackers = trackerlist('dimp', 'super_dimp', range(1))
     dataset = get_dataset('small112')

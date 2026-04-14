@@ -58,7 +58,7 @@ class DiMPSteepestDescentGN(nn.Module):
             else:
                 raise ValueError("Unknown score activation")
 
-    def forward(self, weights, feat, bb, sample_weight=None, num_iter=None, compute_losses=True):
+    def forward(self, weights, feat, bb, sample_weight=None, num_iter=None, compute_losses=True, return_aux=False):
         """Runs the optimizer module.
         Note that [] denotes an optional dimension.
         args:
@@ -119,6 +119,13 @@ class DiMPSteepestDescentGN(nn.Module):
             scores = filter_layer.apply_filter(feat, weights)
             scores = self.score_activation(scores, target_mask)
             losses.append((((sample_weight * (scores - label_map)) ** 2).sum() + reg_weight * (weights ** 2).sum()) / num_sequences)
+        if return_aux:
+            aux_data = {
+                'optimizer_label_map': label_map,
+                'optimizer_target_mask': target_mask,
+                'optimizer_spatial_weight': spatial_weight,
+            }
+            return (weights, weight_iterates, losses, aux_data)
         return (weights, weight_iterates, losses)
 
 

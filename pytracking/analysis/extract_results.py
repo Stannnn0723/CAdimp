@@ -46,7 +46,7 @@ def calc_seq_err_robust(pred_bb, anno_bb, dataset, target_visible=None):
         raise Exception('Error: Invalid results')
 
     if torch.isnan(anno_bb).any():
-        if dataset == 'uav':
+        if dataset in ['uav', 'small112', 'small90']:
             pass
         else:
             raise Exception('Warning: NaNs in annotation')
